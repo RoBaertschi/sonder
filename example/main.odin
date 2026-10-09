@@ -4,7 +4,7 @@ import "core:os"
 import ".."
 
 main :: proc() {
-	input := "return 3;"
+	input := "return -(4 + 4) / 0;"
 	m := sonder.module_new()
 
 	p: Parser

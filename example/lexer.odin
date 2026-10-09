@@ -7,6 +7,12 @@ Token_Kind :: enum {
 	EOF,
 
 	Semicolon,
+	Plus,
+	Minus,
+	Slash,
+	Asterisk,
+	Paren_Open,
+	Paren_Close,
 
 	Return,
 
@@ -102,7 +108,15 @@ l_next :: proc(l: ^Lexer) -> (t: Token) {
 
 	switch l.ch {
 	case utf8.RUNE_EOF: t.kind = .EOF
+
 	case ';': t.kind = .Semicolon
+	case '+': t.kind = .Plus
+	case '-': t.kind = .Minus
+	case '/': t.kind = .Slash
+	case '*': t.kind = .Asterisk
+	case '(': t.kind = .Paren_Open
+	case ')': t.kind = .Paren_Close
+
 	case '0'..='9':
 		return l_lex_number(l)
 	case:
