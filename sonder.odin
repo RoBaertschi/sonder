@@ -8,8 +8,6 @@ import "core:container/xar"
 
 import "base:runtime"
 
-Node_Id :: distinct u32
-
 Module :: struct {
 	arena: virtual.Arena,
 	alloc: mem.Allocator,
@@ -24,6 +22,40 @@ module_new :: proc() -> (m: ^Module) {
 
 	return
 }
+
+Type_Kind :: enum {
+	Bottom,
+	Top,
+	Integer,
+}
+
+Type :: struct {
+	kind:     Type_Kind,
+	constant: int,
+}
+
+@(rodata)
+type_bottom := Type { kind = .Bottom }
+
+@(rodata)
+type_top := Type { kind = .Top }
+
+type_integer_constant :: proc(constant: int) -> (t: Type) {
+	t.kind     = .Integer
+	t.constant = constant
+	return
+}
+
+type_is_constant :: proc(t: Type) -> (is_constant: bool) {
+	switch t.kind {
+	case .Integer: is_constant = true
+	case .Top:     is_constant = true
+	case .Bottom:  is_constant = false
+	}
+	return
+}
+
+Node_Id :: distinct u32
 
 Node_Kind :: enum {
 	Start,
@@ -83,12 +115,11 @@ Node :: struct {
 	kind:     Node_Kind,
 	inputs:   Node_Edges,
 	outputs:  Node_Edges,
-	constant: int,
+	type:     Type,
 }
 
 node_new :: proc(m: ^Module, kind: Node_Kind, nodes: ..^Node) -> (result: ^Node) {
 	result, _ = xar.push_back_elem_and_get_ptr(&m.nodes, {})
-
 
 	result.kind = kind
 	result.id   = Node_Id(xar.len(m.nodes)-1)
@@ -117,7 +148,7 @@ node_return :: proc(m: ^Module, ctrl: ^Node, data: ^Node) -> (result: ^Node) {
 
 node_constant :: proc(m: ^Module, start: ^Node, constant: int) -> (result: ^Node) {
 	result = node_new(m, .Constant, start)
-	result.constant = constant
+	result.type = type_integer_constant(constant)
 	return
 }
 
@@ -134,7 +165,7 @@ node_string :: proc(node: ^Node, allocator: mem.Allocator) -> string {
 	case .Return:   strings.write_string(&b, "Return")
 	case .Constant:
 		strings.write_string(&b, "Constant ")
-		strings.write_int(&b, node.constant)
+		strings.write_int(&b, node.type.constant)
 	}
 
 	shrink(&b.buf)
