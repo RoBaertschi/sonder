@@ -1,5 +1,6 @@
 package sonder
 
+import "core:fmt"
 import "core:mem"
 import "core:sync"
 import "core:strings"
@@ -12,14 +13,19 @@ Module :: struct {
 	arena: virtual.Arena,
 	alloc: mem.Allocator,
 
+	string_interner: strings.Intern,
+
 	nodes: xar.Array(Node, 5),
 	start: ^Node,
+
+	node_scope_free_list: ^Node_Scope_Node,
 }
 
 module_new :: proc() -> (m: ^Module) {
 	m, _    = virtual.arena_growing_bootstrap_new(Module, "arena")
 	m.alloc = virtual.arena_allocator(&m.arena)
 	xar.init(&m.nodes, m.alloc)
+	strings.intern_init(&m.string_interner, m.alloc, context.allocator)
 
 	return
 }
@@ -68,6 +74,9 @@ Node_Kind :: enum {
 	Start,
 	Return,
 	Constant,
+	Scope,
+
+	// Operators
 	Add,
 	Sub,
 	Mul,
@@ -88,6 +97,7 @@ node_metadata := [Node_Kind]Node_Metadata{
 	.Start    = { flags = { .Cfg } },
 	.Return   = { flags = { .Cfg } },
 	.Constant = {},
+	.Scope    = {},
 	.Add 		  = {},
 	.Sub 		  = {},
 	.Mul 		  = {},
@@ -108,28 +118,34 @@ node_edges_clear :: proc(edges: ^Node_Edges) {
 	clear(&edges.rest)
 }
 
-node_edges_push :: proc(edges: ^Node_Edges, node: ^Node) {
+node_edges_push :: proc(edges: ^Node_Edges, node: ^Node) -> (index: int) {
+	index = edges.len
 	if edges.len < NODE_INLINED_EDGES_COUNT {
 		edges.inlined[edges.len] = node
 		edges.len += 1
 	} else {
 		edges.len += append(&edges.rest, node)
 	}
+	return
+}
+
+node_edges_pop :: proc(edges: ^Node_Edges, loc := #caller_location) -> (node: ^Node) {
+	assert(0 < edges.len, loc = loc)
+	if edges.len <= NODE_INLINED_EDGES_COUNT {
+		node = edges.inlined[edges.len - 1]
+	} else {
+		node = pop(&edges.rest, loc = loc)
+	}
+	edges.len -= 1
+	return
 }
 
 node_edges_unordered_remove :: proc(edges: ^Node_Edges, i: int, loc := #caller_location) {
 	runtime.bounds_check_error_loc(loc, i, edges.len)
-
-	if i < NODE_INLINED_EDGES_COUNT {
-		if edges.len < NODE_INLINED_EDGES_COUNT {
-			edges.inlined[i] = edges.inlined[edges.len - 1]
-		} else {
-			edges.inlined[i] = pop(&edges.rest)
-		}
-	} else {
-		unordered_remove(&edges.rest, i)
+	removed := node_edges_pop(edges)
+	if 0 < edges.len && i != edges.len /* Popped last element */ {
+		node_edges_set(edges, i, removed)
 	}
-	edges.len -= 1
 }
 
 node_edges_set :: proc(edges: ^Node_Edges, i: int, node: ^Node, loc := #caller_location) {
@@ -151,12 +167,45 @@ node_edges_get :: proc(edges: Node_Edges, i: int, loc := #caller_location) -> (n
 	return
 }
 
+node_edges_find :: proc(edges: Node_Edges, n: ^Node) -> (index: int) {
+	edges := edges
+
+	index = -1
+	inlined_slice := edges.inlined[:min(NODE_INLINED_EDGES_COUNT, edges.len)]
+	rest_slice    := edges.rest[:max(edges.len - NODE_INLINED_EDGES_COUNT, 0)]
+
+	for inlined, i in inlined_slice {
+		if inlined == n {
+			index = i
+			break
+		}
+	}
+
+	if index == -1 {
+		for rest, i in rest_slice {
+			if rest == n {
+				index = i + NODE_INLINED_EDGES_COUNT
+				break
+			}
+		}
+	}
+
+	return
+}
+
+Node_Scope_Node :: struct {
+	prev:  ^Node_Scope_Node,
+	names: map[string]int,
+}
+
 Node :: struct {
 	id:       Node_Id,
 	kind:     Node_Kind,
 	inputs:   Node_Edges,
 	outputs:  Node_Edges,
 	type:     Type,
+
+	scope:    ^Node_Scope_Node,
 }
 
 node_new :: proc(m: ^Module, kind: Node_Kind, nodes: ..^Node) -> (result: ^Node) {
@@ -177,22 +226,146 @@ node_new :: proc(m: ^Module, kind: Node_Kind, nodes: ..^Node) -> (result: ^Node)
 	return
 }
 
-node_remove_use :: proc(m: ^Module, node: ^Node, use: ^Node) {
-	use_index := -1
-	for i in 0..<node.outputs.len {
-		if node_edges_get(node.outputs, i) == use {
-			use_index = i
+node_start :: proc(m: ^Module) -> (result: ^Node) {
+	result = node_new(m, .Start)
+	return
+}
+
+node_return :: proc(m: ^Module, ctrl: ^Node, data: ^Node) -> (result: ^Node) {
+	result = node_new(m, .Return, ctrl, data)
+	return
+}
+
+node_constant_from_type :: proc(m: ^Module, start: ^Node, constant: Type) -> (result: ^Node) {
+	result = node_new(m, .Constant, start)
+	result.type = constant
+	return
+}
+
+node_constant_from_int :: proc(m: ^Module, start: ^Node, constant: int) -> (result: ^Node) {
+	result = node_constant_from_type(m, start, type_integer_constant(constant))
+	return
+}
+
+node_constant :: proc{
+	node_constant_from_type,
+	node_constant_from_int,
+}
+
+node_scope :: proc(m: ^Module) -> (result: ^Node) {
+	result = node_new(m, .Scope)
+	return
+}
+
+node_scope_push :: proc(m: ^Module, s: ^Node) {
+	scope_node := m.node_scope_free_list
+	if scope_node != nil {
+		m.node_scope_free_list = scope_node.prev
+	} else {
+		scope_node, _    = virtual.new(&m.arena, Node_Scope_Node)
+		scope_node.names = make(map[string]int, 4, allocator = m.alloc)
+	}
+	scope_node.prev = s.scope
+	s.scope 			  = scope_node
+}
+
+node_scope_pop :: proc(m: ^Module, s: ^Node) {
+	// Remove old inputs
+	node_pop_n(m, s, len(s.scope.names))
+
+	// Reset scope without freeing data (for reuse)
+	clear(&s.scope.names)
+
+	// Pop from scope
+	old_scope := s.scope
+	s.scope = old_scope.prev
+
+	// Push to module free list
+	old_scope.prev = m.node_scope_free_list
+	m.node_scope_free_list = old_scope
+}
+
+node_scope_define :: proc(m: ^Module, s: ^Node, variable: string, node: ^Node) -> (result: ^Node) {
+	interned_variable, _ := strings.intern_get(&m.string_interner, variable)
+	if interned_variable not_in s.scope.names {
+		s.scope.names[interned_variable] = node_add_def(m, s, node)
+		result = node
+	}
+	return
+}
+
+node_scope_set :: proc(m: ^Module, s: ^Node, variable: string, node: ^Node) -> (found: bool) {
+	interned_variable, _ := strings.intern_get(&m.string_interner, variable)
+
+	for current_scope := s.scope; current_scope != nil; current_scope = current_scope.prev {
+		if old_node_index, ok := current_scope.names[interned_variable]; ok {
+			node_set_def(m, s, old_node_index, node)
+			found = true
 			break
 		}
 	}
-	node_edges_unordered_remove(&node.outputs, use_index)
+
+	return
+}
+
+node_scope_get :: proc(m: ^Module, s: ^Node, variable: string) -> (result: ^Node) {
+	interned_variable, _ := strings.intern_get(&m.string_interner, variable)
+
+	for current_scope := s.scope; current_scope != nil; current_scope = current_scope.prev {
+		if result_index, ok := current_scope.names[interned_variable]; ok {
+			result = node_edges_get(s.inputs, result_index)
+			break
+		}
+	}
+	return
+}
+
+node_add :: proc(m: ^Module, lhs, rhs: ^Node) -> (result: ^Node) {
+	result = node_new(m, .Add, nil, lhs, rhs)
+	return
+}
+
+node_sub :: proc(m: ^Module, lhs, rhs: ^Node) -> (result: ^Node) {
+	result = node_new(m, .Sub, nil, lhs, rhs)
+	return
+}
+
+node_mul :: proc(m: ^Module, lhs, rhs: ^Node) -> (result: ^Node) {
+	result = node_new(m, .Mul, nil, lhs, rhs)
+	return
+}
+
+node_div :: proc(m: ^Module, lhs, rhs: ^Node) -> (result: ^Node) {
+	result = node_new(m, .Div, nil, lhs, rhs)
+	return
+}
+
+node_minus :: proc(m: ^Module, lhs: ^Node) -> (result: ^Node) {
+	result = node_new(m, .Minus, nil, lhs)
+	return
+}
+
+node_remove_use :: proc(m: ^Module, node: ^Node, use: ^Node) {
+	node_edges_unordered_remove(&node.outputs, node_edges_find(node.outputs, use))
+}
+
+node_add_def :: proc(m: ^Module, n: ^Node, new_def: ^Node) -> (n_index: int) {
+	n_index = node_edges_push(&n.inputs, new_def)
+	if new_def != nil {
+		node_edges_push(&new_def.outputs, n)
+	}
+	return
+}
+
+node_add_use :: proc(n: ^Node, new_use: ^Node) {
+	node_edges_push(&n.outputs, new_use)
 }
 
 node_set_def :: proc(m: ^Module, n: ^Node, index: int, new_def: ^Node) -> (flow_node: ^Node) {
 	old_def := node_edges_get(n.inputs, index)
 	if old_def != new_def {
 		if new_def != nil {
-			node_edges_push(&new_def.outputs, n)
+			node_add_use(new_def, n)
 		}
 
 		if old_def != nil {
@@ -214,30 +387,49 @@ node_set_def :: proc(m: ^Module, n: ^Node, index: int, new_def: ^Node) -> (flow_
 	return
 }
 
+node_pop_n :: proc(m: ^Module, n: ^Node, count: int) {
+	for i in 0..<count {
+		node := node_edges_pop(&n.inputs)
+		if node != nil {
+			node_remove_use(m, node, n)
+			if node.outputs.len == 0 {
+				node_kill(m, node)
+			}
+		}
+	}
+}
+
 node_kill :: proc(m: ^Module, n: ^Node) {
 	assert(n.outputs.len == 0)
-	for i in 0..<n.inputs.len {
-		node_set_def(m, n, i, nil)
-	}
-	node_edges_clear(&n.inputs)
+	node_pop_n(m, n, n.inputs.len)
 	n^ = {}
 	// TODO(robin): free list?
 }
 
+PEEPHOLE_DISABLE :: #config(SONDER_PEEPHOLE_DISABLE, false)
+
 node_peephole :: proc(m: ^Module, n: ^Node) -> (out: ^Node) {
 	out = n
+
+	if PEEPHOLE_DISABLE {
+		return
+	}
 
 	// compute
 
 	type: Type
 
 	switch n.kind {
-	case .Start, .Return: // do nothing
+	case .Start, .Return, .Scope: // do nothing
 
 	case .Constant: type = n.type
 	case .Add, .Sub, .Mul, .Div:
-		t1 := node_edges_get(n.inputs, 1).type
-		t2 := node_edges_get(n.inputs, 2).type
+		i1 := node_edges_get(n.inputs, 1)
+		i2 := node_edges_get(n.inputs, 2)
+
+		t1 := i1.type if i1 != nil else type_bottom
+		t2 := i2.type if i2 != nil else type_bottom
+
 		if type_is_constant_integer(t1) &&
 		   type_is_constant_integer(t2)
 		{
@@ -272,57 +464,6 @@ node_peephole :: proc(m: ^Module, n: ^Node) -> (out: ^Node) {
 	return
 }
 
-node_start :: proc(m: ^Module) -> (result: ^Node) {
-	result = node_new(m, .Start)
-	return
-}
-
-node_return :: proc(m: ^Module, ctrl: ^Node, data: ^Node) -> (result: ^Node) {
-	result = node_new(m, .Return, ctrl, data)
-	return
-}
-
-node_constant_from_type :: proc(m: ^Module, start: ^Node, constant: Type) -> (result: ^Node) {
-	result = node_new(m, .Constant, start)
-	result.type = constant
-	return
-}
-
-node_constant_from_int :: proc(m: ^Module, start: ^Node, constant: int) -> (result: ^Node) {
-	result = node_constant_from_type(m, start, type_integer_constant(constant))
-	return
-}
-
-node_constant :: proc{
-	node_constant_from_type,
-	node_constant_from_int,
-}
-
-node_add :: proc(m: ^Module, lhs, rhs: ^Node) -> (result: ^Node) {
-	result = node_new(m, .Add, nil, lhs, rhs)
-	return
-}
-
-node_sub :: proc(m: ^Module, lhs, rhs: ^Node) -> (result: ^Node) {
-	result = node_new(m, .Sub, nil, lhs, rhs)
-	return
-}
-
-node_mul :: proc(m: ^Module, lhs, rhs: ^Node) -> (result: ^Node) {
-	result = node_new(m, .Mul, nil, lhs, rhs)
-	return
-}
-
-node_div :: proc(m: ^Module, lhs, rhs: ^Node) -> (result: ^Node) {
-	result = node_new(m, .Div, nil, lhs, rhs)
-	return
-}
-
-node_minus :: proc(m: ^Module, lhs: ^Node) -> (result: ^Node) {
-	result = node_new(m, .Minus, nil, lhs)
-	return
-}
-
 node_is_cfg :: proc(node: ^Node) -> bool {
 	return .Cfg in node_metadata[node.kind].flags
 }
@@ -337,6 +478,7 @@ node_string :: proc(node: ^Node, allocator: mem.Allocator) -> string {
 	case .Constant:
 		strings.write_string(&b, "Constant ")
 		strings.write_int(&b, node.type.constant)
+	case .Scope:  strings.write_string(&b, "Scope")
 	case .Add:    strings.write_string(&b, "Add")
 	case .Sub:    strings.write_string(&b, "Sub")
 	case .Mul:    strings.write_string(&b, "Mul")

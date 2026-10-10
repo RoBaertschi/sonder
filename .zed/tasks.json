@@ -6,4 +6,20 @@
     "label": "Build Example",
     "command": "odin build example -debug",
   },
+  {
+    "label": "Run Example",
+    "command": "odin run example"
+  },
+  {
+    "label": "Run Example (dot)",
+    "command": "odin run example | dot -Tpng -o graph.png"
+  },
+  {
+    "label": "Run Example (No Peephole)",
+    "command": "odin run example -define:SONDER_PEEPHOLE_DISABLE=true"
+  },
+  {
+    "label": "Run Example (dot, No Peephole)",
+    "command": "odin run example -define:SONDER_PEEPHOLE_DISABLE=true | dot -Tpng -o graph.png"
+  }
 ]

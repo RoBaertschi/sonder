@@ -13,8 +13,13 @@ Token_Kind :: enum {
 	Asterisk,
 	Paren_Open,
 	Paren_Close,
+	Brace_Open,
+	Brace_Close,
+	Equal,
 
+	Identifier,
 	Return,
+	Int,
 
 	Constant,
 }
@@ -82,10 +87,11 @@ l_lex_identifier :: proc(l: ^Lexer) -> (t: Token) {
 
 	t.content = l.input[t.pos:l.pos]
 
-	if t.content == "return" {
-		t.kind = .Return
-	} else {
-		l_error(l, t.pos, "invalid identifier %q", t.content)
+	t.kind = .Identifier
+
+	switch t.content {
+	case "return": t.kind = .Return
+	case "int":    t.kind = .Int
 	}
 
 	return
@@ -116,6 +122,9 @@ l_next :: proc(l: ^Lexer) -> (t: Token) {
 	case '*': t.kind = .Asterisk
 	case '(': t.kind = .Paren_Open
 	case ')': t.kind = .Paren_Close
+	case '{': t.kind = .Brace_Open
+	case '}': t.kind = .Brace_Close
+	case '=': t.kind = .Equal
 
 	case '0'..='9':
 		return l_lex_number(l)

@@ -37,12 +37,7 @@ dot_printer_print_node :: proc(p: ^Dot_Printer, n: ^Node) {
 		io.write_string(p.output, "];\n")
 
 		for i in 0..<n.outputs.len {
-			output: ^Node
-			if i < NODE_INLINED_EDGES_COUNT {
-				output = n.outputs.inlined[i]
-			} else {
-				output = n.outputs.rest[i - NODE_INLINED_EDGES_COUNT]
-			}
+			output := node_edges_get(n.outputs, i)
 
 			if output == nil {
 				continue
@@ -59,12 +54,7 @@ dot_printer_print_node :: proc(p: ^Dot_Printer, n: ^Node) {
 		}
 
 		for i in 0..<n.outputs.len {
-			output: ^Node
-			if i < NODE_INLINED_EDGES_COUNT {
-				output = n.outputs.inlined[i]
-			} else {
-				output = n.outputs.rest[i - NODE_INLINED_EDGES_COUNT]
-			}
+			output := node_edges_get(n.outputs, i)
 
 			dot_printer_print_node(p, output)
 		}
