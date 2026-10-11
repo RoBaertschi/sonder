@@ -36,6 +36,8 @@ dot_printer_print_node :: proc(p: ^Dot_Printer, n: ^Node) {
 		io.write_quoted_string(p.output, name)
 		io.write_string(p.output, "];\n")
 
+		is_input_cfg := node_is_cfg(n)
+
 		for i in 0..<n.outputs.len {
 			output := node_edges_get(n.outputs, i)
 
@@ -47,8 +49,8 @@ dot_printer_print_node :: proc(p: ^Dot_Printer, n: ^Node) {
 			io.write_u64(p.output, u64(n.id))
 			io.write_string(p.output, " -> ")
 			io.write_u64(p.output, u64(output.id))
-			#partial switch output.kind {
-			case .Constant: io.write_string(p.output, " [style=dotted]")
+			if is_input_cfg && node_is_cfg(output) {
+				io.write_string(p.output, " [style=dotted]")
 			}
 			io.write_string(p.output, ";\n")
 		}

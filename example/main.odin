@@ -4,7 +4,9 @@ import "core:os"
 import ".."
 
 main :: proc() {
-	input := "int test = 1;{ int a = test; int b = 3; test = 4; }return 5 + test;"
+	input := """
+	return arg != arg;
+	"""
 	m := sonder.module_new()
 
 	p: Parser

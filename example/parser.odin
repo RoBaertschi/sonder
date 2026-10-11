@@ -6,6 +6,7 @@ import ".."
 
 Precedence :: enum {
 	Lowest,
+	Compare,
 	Sum,
 	Product,
 	Prefix,
@@ -13,10 +14,16 @@ Precedence :: enum {
 
 @(rodata)
 token_precedence := #partial [Token_Kind]Precedence{
-	.Plus 		= .Sum,
-	.Minus 		= .Sum,
-	.Asterisk = .Product,
-	.Slash 		= .Product,
+	.Plus 		     		     = .Sum,
+	.Minus 		    		     = .Sum,
+	.Asterisk    		     = .Product,
+	.Slash 		    		     = .Product,
+	.Equal_Equal 		     = .Compare,
+	.Not_Equal 				     = .Compare,
+	.Less_Than 									= .Compare,
+	.Less_Than_Equal    = .Compare,
+	.Greater_Than       = .Compare,
+	.Greater_Than_Equal = .Compare,
 }
 
 Parser :: struct {
@@ -66,15 +73,33 @@ p_expect_next :: proc(p: ^Parser, t: Token_Kind) -> (ok: bool) {
 
 p_parse :: proc(p: ^Parser) -> (node: ^sonder.Node) {
 	p.start = sonder.node_start(p.module)
+
+	// TODO(robin): is this intentional
+	_ = sonder.node_peephole(p.module, p.start)
 	p.scope = sonder.node_scope(p.module)
 
 	p.module.start = p.start
 	defer p.module.start = nil
 
+	sonder.node_scope_push(p.module, p.scope)
+	defer sonder.node_scope_pop(p.module, p.scope)
+
+	sonder.node_scope_define(p.module, p.scope, sonder.NODE_SCOPE_CTRL, sonder.node_peephole(p.module, sonder.node_proj(p.module, p.start, 0)))
+	sonder.node_scope_define(p.module, p.scope, sonder.NODE_SCOPE_ARG,  sonder.node_peephole(p.module, sonder.node_proj(p.module, p.start, 1)))
+
 	node = p_parse_block(p)
 	p_expect_next(p, .EOF)
 
 	return node
+}
+
+p_ctrl :: proc(p: ^Parser) -> (ctrl: ^sonder.Node) {
+	ctrl = sonder.node_input(p.scope, 0)
+	return
+}
+
+p_set_ctrl :: proc(p: ^Parser, ctrl: ^sonder.Node) {
+	sonder.node_set_def(p.module, p.scope, 0, ctrl)
 }
 
 p_parse_block :: proc(p: ^Parser) -> (node: ^sonder.Node) {
@@ -111,7 +136,8 @@ p_parse_return_statement :: proc(p: ^Parser) -> (node: ^sonder.Node) {
 	p_next_token(p)
 	value := p_parse_expression(p)
 	p_expect_next(p, .Semicolon)
-	node = sonder.node_peephole(p.module, sonder.node_return(p.module, p.start, value))
+	node = sonder.node_peephole(p.module, sonder.node_return(p.module, p_ctrl(p), value))
+	p_set_ctrl(p, nil)
 	return
 }
 
@@ -180,7 +206,11 @@ p_parse_expression :: proc(p: ^Parser, prec := Precedence.Lowest) -> (node: ^son
 
 	for p.next_token.kind != .Semicolon && prec < token_precedence[p.next_token.kind] {
 		#partial switch p.next_token.kind {
-		case .Plus, .Minus, .Asterisk, .Slash:
+		case .Plus,               .Minus,
+							.Asterisk,           .Slash,
+		     .Equal_Equal,        .Not_Equal,
+							.Less_Than_Equal,    .Less_Than,
+							.Greater_Than_Equal, .Greater_Than:
 			p_next_token(p) // skip previous expression
 			op := p.curr_token.kind
 			p_next_token(p) // skip operator
@@ -193,6 +223,15 @@ p_parse_expression :: proc(p: ^Parser, prec := Precedence.Lowest) -> (node: ^son
 				.Minus    = sonder.node_sub,
 				.Asterisk = sonder.node_mul,
 				.Slash    = sonder.node_div,
+
+				.Equal_Equal = sonder.node_bool_eq,
+				.Not_Equal   = proc(m: ^sonder.Module, lhs, rhs: ^sonder.Node) -> ^sonder.Node { return sonder.node_not(m, sonder.node_peephole(m, sonder.node_bool_eq(m, lhs, rhs))) },
+
+				.Less_Than_Equal = sonder.node_bool_le,
+				.Less_Than       = sonder.node_bool_lt,
+
+				.Greater_Than_Equal = proc(m: ^sonder.Module, lhs, rhs: ^sonder.Node) -> ^sonder.Node { return sonder.node_bool_le(m, rhs, lhs) },
+			 .Greater_Than       = proc(m: ^sonder.Module, lhs, rhs: ^sonder.Node) -> ^sonder.Node { return sonder.node_bool_lt(m, rhs, lhs) },
 			}
 			node = LUT[op](p.module, node, rhs)
 			node = sonder.node_peephole(p.module, node)

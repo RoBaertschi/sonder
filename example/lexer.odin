@@ -16,6 +16,12 @@ Token_Kind :: enum {
 	Brace_Open,
 	Brace_Close,
 	Equal,
+	Equal_Equal,
+	Not_Equal,
+	Less_Than_Equal,
+	Less_Than,
+	Greater_Than_Equal,
+	Greater_Than,
 
 	Identifier,
 	Return,
@@ -57,6 +63,14 @@ l_next_ch :: proc(l: ^Lexer) {
 	} else {
 		l.ch = utf8.RUNE_EOF
 	}
+}
+
+l_peek :: proc(l: ^Lexer) -> (peek_ch: rune) {
+	old_l := l^
+	defer l^ = old_l
+	l_next_ch(l)
+	peek_ch = l.ch
+	return
 }
 
 l_lex_number :: proc(l: ^Lexer) -> (t: Token) {
@@ -110,7 +124,6 @@ l_next :: proc(l: ^Lexer) -> (t: Token) {
 	l_skip_whitespace(l)
 
 	t.pos = l.pos
-	t.content = l.input[l.pos:l.pos+1]
 
 	switch l.ch {
 	case utf8.RUNE_EOF: t.kind = .EOF
@@ -124,7 +137,30 @@ l_next :: proc(l: ^Lexer) -> (t: Token) {
 	case ')': t.kind = .Paren_Close
 	case '{': t.kind = .Brace_Open
 	case '}': t.kind = .Brace_Close
-	case '=': t.kind = .Equal
+
+	case '=':
+		t.kind = .Equal
+	 if l_peek(l) == '=' {
+			l_next_ch(l)
+			t.kind = .Equal_Equal
+		}
+	case '<':
+		t.kind = .Less_Than
+	 if l_peek(l) == '=' {
+			l_next_ch(l)
+			t.kind = .Less_Than_Equal
+		}
+	case '>':
+		t.kind = .Greater_Than
+	 if l_peek(l) == '=' {
+			l_next_ch(l)
+			t.kind = .Greater_Than_Equal
+		}
+	case '!':
+		if l_peek(l) == '=' {
+			l_next_ch(l)
+			t.kind = .Not_Equal
+		}
 
 	case '0'..='9':
 		return l_lex_number(l)
@@ -132,6 +168,7 @@ l_next :: proc(l: ^Lexer) -> (t: Token) {
 		return l_lex_identifier(l)
 	}
 
+	t.content = l.input[t.pos:l.pos+1]
 	l_next_ch(l)
 	return
 }
