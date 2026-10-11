@@ -59,6 +59,9 @@ type_integer_bottom := Type { kind = .Integer, constant = 1 }
 @(rodata)
 type_integer_top := Type { kind = .Integer, constant = 0 }
 
+@(rodata)
+type_tuple_if := Type { kind = .Tuple, tuple = { { kind = .Ctrl }, { kind = .Ctrl } } }
+
 TYPE_INTEGERS :: bit_set[Type_Kind]{.Integer_Constant, .Integer}
 
 type_integer_constant :: proc(constant: int) -> (t: Type) {
@@ -138,6 +141,8 @@ Node_Kind :: enum {
 	Constant,
 	Scope,
 	Proj,
+	If,
+	Phi,
 
 	// Operators
 	Add,
@@ -155,7 +160,7 @@ NODE_BOOL :: bit_set[Node_Kind]{.Bool_EQ, .Bool_LT, .Bool_LE}
 
 Node_Metadata_Flag :: enum {
 	Cfg,
-	Multinode,
+	MultiNode,
 }
 
 Node_Metadata :: struct {
@@ -164,8 +169,9 @@ Node_Metadata :: struct {
 
 @(rodata)
 node_metadata := #partial [Node_Kind]Node_Metadata{
-	.Start    = { flags = { .Cfg, .Multinode } },
+	.Start    = { flags = { .Cfg, .MultiNode } },
 	.Return   = { flags = { .Cfg } },
+	.If       = { flags = { .Cfg, .MultiNode } },
 }
 
 NODE_INLINED_EDGES_COUNT :: 4
@@ -272,18 +278,24 @@ Node :: struct {
 	scope:    ^Node_Scope_Node,
 }
 
-node_new :: proc(m: ^Module, kind: Node_Kind, nodes: ..^Node) -> (result: ^Node) {
+node_new_cap :: proc(m: ^Module, kind: Node_Kind, input_cap: int) -> (result: ^Node) {
 	result, _ = xar.push_back_elem_and_get_ptr(&m.nodes, {})
 
 	result.kind = kind
 	result.id   = Node_Id(xar.len(m.nodes)-1)
-	result.inputs.rest  = make([dynamic]^Node, max(0, len(nodes)-NODE_INLINED_EDGES_COUNT), allocator = m.alloc)
+	result.inputs.rest  = make([dynamic]^Node, max(0, input_cap-NODE_INLINED_EDGES_COUNT), allocator = m.alloc)
 	result.outputs.rest = make([dynamic]^Node, allocator = m.alloc)
+
+	return
+}
+
+node_new :: proc(m: ^Module, kind: Node_Kind, nodes: ..^Node) -> (result: ^Node) {
+	result = node_new_cap(m, kind, len(nodes))
 
 	for node in nodes {
 		node_edges_push(&result.inputs, node)
 		if node != nil {
-			node_edges_push(&node.outputs, result)
+			node_add_use(node, result)
 		}
 	}
 
@@ -302,9 +314,32 @@ node_return :: proc(m: ^Module, ctrl: ^Node, data: ^Node) -> (result: ^Node) {
 }
 
 node_proj :: proc(m: ^Module, ctrl: ^Node, index: int) -> (result: ^Node) {
-	assert(.Multinode in node_metadata[ctrl.kind].flags)
+	assert(.MultiNode in node_metadata[ctrl.kind].flags)
 	result = node_new(m, .Proj, ctrl)
 	result.proj = index
+	return
+}
+
+node_if :: proc(m: ^Module, ctrl, pred: ^Node) -> (result: ^Node) {
+	result = node_new(m, .If, ctrl, pred)
+	return
+}
+
+node_phi :: proc(m: ^Module, region: ^Node, inputs: ..^Node) -> (result: ^Node) {
+	result = node_new_cap(m, .Phi, len(inputs) + 1)
+
+	node_edges_push(&result.inputs, region)
+	if region != nil {
+		node_add_use(region, result)
+	}
+
+	for node in inputs {
+		node_edges_push(&result.inputs, node)
+		if node != nil {
+			node_add_use(node, result)
+		}
+	}
+
 	return
 }
 
@@ -440,13 +475,50 @@ node_scope_get :: proc(m: ^Module, s: ^Node, variable: string) -> (result: ^Node
 	return
 }
 
+// Remember to push a new scope after this
+node_scope_dup :: proc(m: ^Module, scope: ^Node) -> (dup_scope: ^Node) {
+	dup_scope = node_scope(m)
+	dup_scope.scope = scope.scope
+	for i in 0..<scope.inputs.len {
+		node_add_def(m, dup_scope, node_input(scope, i))
+	}
+	return
+}
+
+node_scope_merge :: proc(m: ^Module, into, from: ^Node) -> (r: ^Node) {
+	assert(node_len_input(into) == node_len_input(from))
+	assert(into.scope == from.scope)
+	// TODO(robin): create region
+	if true do unimplemented()
+	defer node_kill(m, from) // dies
+
+	// Skip the ctrl node
+	for i in 1..<node_len_input(into) {
+		a_node, b_node := node_input(into, i), node_input(from, i)
+		if a_node != b_node {
+			node_set_def(m, into, i, node_peephole(m, node_phi(m, r, a_node, b_node)))
+		}
+	}
+	return
+}
+
 node_input :: proc(node: ^Node, index: int) -> (input: ^Node) {
 	input = node_edges_get(node.inputs, index)
 	return
 }
 
+node_len_input :: proc(node: ^Node) -> (len: int) {
+	len = node.inputs.len
+	return
+}
+
 node_output :: proc(node: ^Node, index: int) -> (output: ^Node) {
 	output = node_edges_get(node.outputs, index)
+	return
+}
+
+node_len_output :: proc(node: ^Node) -> (len: int) {
+	len = node.outputs.len
 	return
 }
 
@@ -552,6 +624,7 @@ node_peephole :: proc(m: ^Module, n: ^Node) -> (out: ^Node) {
 			if t.kind == .Tuple {
 				type = t.tuple[n.proj]
 			}
+		case .If: type = type_tuple_if
 		case .Constant: type = n.type
 		case .Add, .Sub, .Mul, .Div, .Bool_EQ, .Bool_LT, .Bool_LE:
 			i1 := node_edges_get(n.inputs, 1)
@@ -718,6 +791,7 @@ node_string :: proc(node: ^Node, allocator: mem.Allocator) -> string {
 	case .Proj:
 		strings.write_string(&b, "Proj ")
 		strings.write_int(&b, node.proj)
+	case .If: strings.write_string(&b, "If")
 	case .Constant:
 		strings.write_string(&b, "Constant ")
 		strings.write_int(&b, node.type.constant)
