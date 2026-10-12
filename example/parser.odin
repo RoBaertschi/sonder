@@ -138,7 +138,7 @@ p_parse_return_statement :: proc(p: ^Parser) -> (node: ^sonder.Node) {
 	p_expect_next(p, .Semicolon)
 	node = sonder.node_peephole(p.module, sonder.node_return(p.module, p_ctrl(p), value))
 	sonder.node_stop_add_return(p.module, p.stop, node)
-	p_set_ctrl(p, nil)
+	p_set_ctrl(p, sonder.node_constant(p.module, p.start, sonder.type_xctrl))
 	return
 }
 

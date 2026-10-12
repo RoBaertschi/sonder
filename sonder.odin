@@ -51,7 +51,10 @@ type_bottom := Type { kind = .Bottom }
 type_top := Type { kind = .Top }
 
 @(rodata)
-type_ctrl := Type { kind = .Ctrl }
+type_ctrl := Type { kind = .Ctrl, constant = 0 }
+
+@(rodata)
+type_xctrl := Type { kind = .Ctrl, constant = 1 }
 
 @(rodata)
 type_integer_bottom := Type { kind = .Integer, constant = 1 }
