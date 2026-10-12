@@ -641,6 +641,14 @@ node_copy :: proc(m: ^Module, kind: Node_Kind, lhs, rhs: ^Node) -> (copy: ^Node)
 	return
 }
 
+node_keep :: proc(node: ^Node) -> ^Node {
+	node_add_use(node, nil)
+	return node
+}
+node_unkeep :: proc(node: ^Node) {
+	node_remove_use(node, nil)
+}
+
 PEEPHOLE_DISABLE :: #config(SONDER_PEEPHOLE_DISABLE, false)
 
 node_peephole :: proc(m: ^Module, n: ^Node) -> (out: ^Node) {
@@ -650,17 +658,10 @@ node_peephole :: proc(m: ^Module, n: ^Node) -> (out: ^Node) {
 		return
 	}
 
-	keep :: proc(node: ^Node) {
-		node_add_use(node, nil)
-	}
-	unkeep :: proc(node: ^Node) {
-		node_remove_use(node, nil)
-	}
-
 	dead_code_elimination :: proc(m: ^Module, node, replace_with: ^Node) -> ^Node {
 		if node != replace_with && node.outputs.len == 0 {
-			keep(replace_with)
-			defer unkeep(replace_with)
+			node_keep(replace_with)
+			defer node_unkeep(replace_with)
 
 			node_kill(m, node)
 		}
@@ -784,6 +785,18 @@ node_peephole :: proc(m: ^Module, n: ^Node) -> (out: ^Node) {
 
 				if type_is_constant_integer(t2) && t2.constant == 0 { // Add with 0
 					idealize_node = lhs
+				} else if lhs == rhs { // Add by itself
+					idealize_node = node_mul(m, lhs, node_peephole(m, node_constant(m, m.start, 2)))
+				} else if lhs.kind != .Add && rhs.kind == .Add { // Move non-add to rhs
+					idealize_node = swap12(n)
+				} else if rhs.kind == .Add { // rotate x + (y + z) -> (x + y) + z
+					idealize_node = node_add(m, node_peephole(m, node_add(m, lhs, node_input(rhs, 1))), node_input(rhs, 2))
+				} else if lhs.kind != .Add {
+					if spline_cmp(lhs, rhs) {
+						idealize_node = swap12(n)
+					}
+				} else if type_is_constant(node_input(lhs, 2).type) && type_is_constant(t2) { // (x + constant1) + constant2 -> x + (constant1 + constant2)
+					idealize_node = node_add(m, node_input(lhs, 1), node_peephole(m, node_add(m, node_input(lhs, 2), rhs)))
 				} else if phi := node_input(lhs, 2); // Holy moly, ((x + (phi cons)) + con), ((x + (phi cons)) + (phi cons)) -> x + (phi con0+con0 ...)
 				          phi.kind == .Phi &&
 	 	           node_all_inputs_constant(phi) &&
@@ -808,18 +821,6 @@ node_peephole :: proc(m: ^Module, n: ^Node) -> (out: ^Node) {
 
 					rhs_phi      := node_peephole(m, node_phi(m, nodes[0], ..nodes[1:]))
 					idealize_node = node_add(m, node_input(lhs, 1), rhs_phi)
-				} else if lhs == rhs { // Add by itself
-					idealize_node = node_mul(m, lhs, node_peephole(m, node_constant(m, m.start, 2)))
-				} else if lhs.kind != .Add && rhs.kind == .Add { // Move non-add to rhs
-					idealize_node = swap12(n)
-				} else if rhs.kind == .Add { // rotate x + (y + z) -> (x + y) + z
-					idealize_node = node_add(m, node_peephole(m, node_add(m, lhs, node_input(rhs, 1))), node_input(rhs, 2))
-				} else if lhs.kind != .Add {
-					if spline_cmp(lhs, rhs) {
-						idealize_node = swap12(n)
-					}
-				} else if type_is_constant(node_input(lhs, 2).type) && type_is_constant(t2) { // (x + constant1) + constant2 -> x + (constant1 + constant2)
-					idealize_node = node_add(m, node_input(lhs, 1), node_peephole(m, node_add(m, node_input(lhs, 2), rhs)))
 				} else if spline_cmp(node_input(lhs, 2), rhs) { // (x + y) + z -> (x + z) + y
 					idealize_node = node_add(m, node_peephole(m, node_add(m, node_input(lhs, 1), rhs)), node_input(lhs, 2))
 				}

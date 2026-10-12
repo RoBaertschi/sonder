@@ -32,6 +32,7 @@ Parser :: struct {
 
 	module: ^sonder.Module,
 	start:  ^sonder.Node,
+	stop:   ^sonder.Node,
 	scope:  ^sonder.Node,
 }
 
@@ -73,24 +74,25 @@ p_expect_next :: proc(p: ^Parser, t: Token_Kind) -> (ok: bool) {
 
 p_parse :: proc(p: ^Parser) -> (node: ^sonder.Node) {
 	p.start = sonder.node_start(p.module)
-
-	// TODO(robin): is this intentional
-	_ = sonder.node_peephole(p.module, p.start)
+	p.stop  = sonder.node_stop(p.module)
 	p.scope = sonder.node_scope(p.module)
 
 	p.module.start = p.start
 	defer p.module.start = nil
 
-	sonder.node_scope_push(p.module, p.scope)
-	defer sonder.node_scope_pop(p.module, p.scope)
+	{
+		sonder.node_scope_push(p.module, p.scope)
+		defer sonder.node_scope_pop(p.module, p.scope)
 
-	sonder.node_scope_define(p.module, p.scope, sonder.NODE_SCOPE_CTRL, sonder.node_peephole(p.module, sonder.node_proj(p.module, p.start, 0)))
-	sonder.node_scope_define(p.module, p.scope, sonder.NODE_SCOPE_ARG,  sonder.node_peephole(p.module, sonder.node_proj(p.module, p.start, 1)))
+		sonder.node_scope_define(p.module, p.scope, sonder.NODE_SCOPE_CTRL, sonder.node_peephole(p.module, sonder.node_proj(p.module, p.start, 0)))
+		sonder.node_scope_define(p.module, p.scope, sonder.NODE_SCOPE_ARG,  sonder.node_peephole(p.module, sonder.node_proj(p.module, p.start, 1)))
 
-	node = p_parse_block(p)
-	p_expect_next(p, .EOF)
+		p_parse_block(p)
+		p_expect_next(p, .EOF)
+	}
 
-	return node
+	node = sonder.node_peephole(p.module, p.stop)
+	return
 }
 
 p_ctrl :: proc(p: ^Parser) -> (ctrl: ^sonder.Node) {
@@ -108,9 +110,6 @@ p_parse_block :: proc(p: ^Parser) -> (node: ^sonder.Node) {
 
 	for p.curr_token.kind != .Brace_Close && p.curr_token.kind != .EOF {
 		stmt := p_parse_statement(p)
-		if stmt != nil {
-			node = stmt
-		}
 		p_next_token(p)
 	}
 
@@ -123,6 +122,7 @@ p_parse_statement :: proc(p: ^Parser) -> (stmt: ^sonder.Node) {
 	case .Int:        stmt = p_parse_declaration(p)
 	case .Brace_Open: stmt = p_parse_block_statement(p)
 	case .Identifier: stmt = p_parse_assignment_expression(p)
+	case .If:         stmt = p_parse_if_statement(p)
 	case .Semicolon:  stmt = nil
 	case:
 		p_error(p, p.curr_token, "invalid token %v, expected statement", p.curr_token.kind)
@@ -137,6 +137,7 @@ p_parse_return_statement :: proc(p: ^Parser) -> (node: ^sonder.Node) {
 	value := p_parse_expression(p)
 	p_expect_next(p, .Semicolon)
 	node = sonder.node_peephole(p.module, sonder.node_return(p.module, p_ctrl(p), value))
+	sonder.node_stop_add_return(p.module, p.stop, node)
 	p_set_ctrl(p, nil)
 	return
 }
@@ -182,6 +183,47 @@ p_parse_assignment_expression :: proc(p: ^Parser) -> (expr: ^sonder.Node) {
 	return
 }
 
+p_parse_if_statement :: proc(p: ^Parser) -> (stmt: ^sonder.Node) {
+	p_expect(p, .If)
+	p_expect_next(p, .Paren_Open)
+	p_next_token(p)
+	expr := p_parse_expression(p)
+
+	stmt = sonder.node_peephole(p.module, sonder.node_keep(sonder.node_if(p.module, p_ctrl(p), expr)))
+	if_t := sonder.node_peephole(p.module, sonder.node_proj(p.module, stmt, 0))
+	sonder.node_unkeep(stmt)
+	if_f := sonder.node_peephole(p.module, sonder.node_proj(p.module, stmt, 1))
+
+	node_defs := sonder.node_len_inputs(p.scope)
+	t_scope   := p.scope
+	f_scope   := sonder.node_scope_dup(p.module, p.scope)
+
+	p_expect_next(p, .Paren_Close)
+	p_next_token(p)
+
+	p_set_ctrl(p, if_t)
+	p_parse_statement(p)
+
+	p.scope = f_scope
+	p_set_ctrl(p, if_f)
+	if p.next_token.kind == .Else {
+		p_next_token(p)
+		p_next_token(p)
+		p_parse_statement(p)
+	}
+
+	if sonder.node_len_inputs(t_scope) != node_defs || sonder.node_len_inputs(f_scope) != node_defs {
+		p_error(p, p.curr_token, "cannot define a new name on one arm of an if")
+	}
+
+	p.scope = t_scope
+
+	stmt = sonder.node_scope_merge(p.module, t_scope, f_scope)
+	p_set_ctrl(p, stmt)
+
+	return
+}
+
 p_parse_expression :: proc(p: ^Parser, prec := Precedence.Lowest) -> (node: ^sonder.Node) {
 	#partial switch p.curr_token.kind {
 	case .Constant:
@@ -200,6 +242,10 @@ p_parse_expression :: proc(p: ^Parser, prec := Precedence.Lowest) -> (node: ^son
 		if node == nil {
 			p_error(p, p.curr_token, "could not find variable associated with identifier %q", p.curr_token.content)
 		}
+	case .True:
+		node = sonder.node_peephole(p.module, sonder.node_constant(p.module, p.start, 1))
+		case .False:
+			node = sonder.node_peephole(p.module, sonder.node_constant(p.module, p.start, 0))
 	case:
 		p_error(p, p.curr_token, "invalid expression token %v", p.curr_token.kind)
 	}

@@ -49,6 +49,9 @@ dot_printer_print_node :: proc(p: ^Dot_Printer, n: ^Node) {
 			io.write_u64(p.output, u64(n.id))
 			io.write_string(p.output, " -> ")
 			io.write_u64(p.output, u64(output.id))
+			io.write_string(p.output, " [label=\"")
+			io.write_int(p.output, node_edges_find(output.inputs, n))
+			io.write_string(p.output, "\"]")
 			if is_input_cfg && node_is_cfg(output) {
 				io.write_string(p.output, " [style=dotted]")
 			}
