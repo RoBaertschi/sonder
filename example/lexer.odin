@@ -24,8 +24,12 @@ Token_Kind :: enum {
 	Greater_Than,
 
 	Identifier,
-	Return,
+	Else,
+	False,
+	If,
 	Int,
+	Return,
+	True,
 
 	Constant,
 }
@@ -104,8 +108,12 @@ l_lex_identifier :: proc(l: ^Lexer) -> (t: Token) {
 	t.kind = .Identifier
 
 	switch t.content {
-	case "return": t.kind = .Return
+	case "else":   t.kind = .Else
+	case "false":  t.kind = .False
+	case "if":     t.kind = .If
 	case "int":    t.kind = .Int
+	case "return": t.kind = .Return
+	case "true":   t.kind = .True
 	}
 
 	return

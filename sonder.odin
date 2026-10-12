@@ -143,6 +143,8 @@ Node_Kind :: enum {
 	Proj,
 	If,
 	Phi,
+	Region,
+	Stop,
 
 	// Operators
 	Add,
@@ -170,8 +172,10 @@ Node_Metadata :: struct {
 @(rodata)
 node_metadata := #partial [Node_Kind]Node_Metadata{
 	.Start    = { flags = { .Cfg, .MultiNode } },
-	.Return   = { flags = { .Cfg } },
+	.Return   = { flags = { .Cfg             } },
 	.If       = { flags = { .Cfg, .MultiNode } },
+	.Region   = { flags = { .Cfg             } },
+	.Stop     = { flags = { .Cfg             } },
 }
 
 NODE_INLINED_EDGES_COUNT :: 4
@@ -343,6 +347,16 @@ node_phi :: proc(m: ^Module, region: ^Node, inputs: ..^Node) -> (result: ^Node) 
 	return
 }
 
+node_region :: proc(m: ^Module, nodes: ..^Node) -> (result: ^Node) {
+	result = node_new(m, .Region, ..nodes)
+	return
+}
+
+node_stop :: proc(m: ^Module, nodes: ..^Node) -> (result: ^Node) {
+	result = node_new(m, .Stop, ..nodes)
+	return
+}
+
 node_constant_from_type :: proc(m: ^Module, start: ^Node, constant: Type) -> (result: ^Node) {
 	result = node_new(m, .Constant, start)
 	result.type = constant
@@ -408,6 +422,8 @@ node_bool_le :: proc(m: ^Module, lhs, rhs: ^Node) -> (result: ^Node) {
 	result = node_new(m, .Bool_LE, nil, lhs, rhs)
 	return
 }
+
+// Scope
 
 NODE_SCOPE_CTRL :: "$ctrl"
 NODE_SCOPE_ARG  :: "arg"
@@ -486,17 +502,43 @@ node_scope_dup :: proc(m: ^Module, scope: ^Node) -> (dup_scope: ^Node) {
 }
 
 node_scope_merge :: proc(m: ^Module, into, from: ^Node) -> (r: ^Node) {
-	assert(node_len_input(into) == node_len_input(from))
+	assert(node_len_inputs(into) == node_len_inputs(from))
 	assert(into.scope == from.scope)
-	// TODO(robin): create region
-	if true do unimplemented()
+	r = node_peephole(m, node_region(m, nil, node_input(into, 0), node_input(from, 0)))
 	defer node_kill(m, from) // dies
 
 	// Skip the ctrl node
-	for i in 1..<node_len_input(into) {
+	for i in 1..<node_len_inputs(into) {
 		a_node, b_node := node_input(into, i), node_input(from, i)
 		if a_node != b_node {
 			node_set_def(m, into, i, node_peephole(m, node_phi(m, r, a_node, b_node)))
+		}
+	}
+	return
+}
+
+// Stop
+node_stop_ret :: proc(node: ^Node) -> (ret: ^Node) {
+	if node.inputs.len == 1 {
+		ret = node_input(node, 0)
+	}
+	return
+}
+
+node_stop_add_return :: proc(m: ^Module, node: ^Node, ret: ^Node) {
+	node_add_def(m, node, ret)
+}
+
+// Helpers
+
+node_all_inputs_constant :: proc(node: ^Node, start := 1) -> (all_constants: bool) {
+	all_constants = true
+
+	for i in start..<node.inputs.len {
+		input := node_input(node, i)
+		if input == nil || !type_is_constant(input.type) {
+			all_constants = false
+			break
 		}
 	}
 	return
@@ -507,7 +549,7 @@ node_input :: proc(node: ^Node, index: int) -> (input: ^Node) {
 	return
 }
 
-node_len_input :: proc(node: ^Node) -> (len: int) {
+node_len_inputs :: proc(node: ^Node) -> (len: int) {
 	len = node.inputs.len
 	return
 }
@@ -517,7 +559,7 @@ node_output :: proc(node: ^Node, index: int) -> (output: ^Node) {
 	return
 }
 
-node_len_output :: proc(node: ^Node) -> (len: int) {
+node_len_outputs :: proc(node: ^Node) -> (len: int) {
 	len = node.outputs.len
 	return
 }
@@ -583,6 +625,22 @@ node_kill :: proc(m: ^Module, n: ^Node) {
 	// TODO(robin): free list?
 }
 
+node_copy :: proc(m: ^Module, kind: Node_Kind, lhs, rhs: ^Node) -> (copy: ^Node) {
+	LUT := #partial [Node_Kind](#type proc(m: ^Module, lhs, rhs: ^Node) -> ^Node){
+		.Add     = node_add,
+		.Sub     = node_sub,
+		.Mul     = node_mul,
+		.Div     = node_div,
+		.Bool_EQ = node_bool_eq,
+		.Bool_LT = node_bool_lt,
+		.Bool_LE = node_bool_le,
+	}
+
+	copy = LUT[kind](m, lhs, rhs)
+
+	return
+}
+
 PEEPHOLE_DISABLE :: #config(SONDER_PEEPHOLE_DISABLE, false)
 
 node_peephole :: proc(m: ^Module, n: ^Node) -> (out: ^Node) {
@@ -613,7 +671,7 @@ node_peephole :: proc(m: ^Module, n: ^Node) -> (out: ^Node) {
 
 	compute :: proc(m: ^Module, n: ^Node) -> (type: Type) {
 		switch n.kind {
-		case .Scope: // do nothing
+		case .Scope, .Phi, .Stop: // do nothing
 		case .Return:
 			type = type_tuple_from_module(m, node_edges_get(n.inputs, 0).type, node_edges_get(n.inputs, 1).type)
 		case .Start:
@@ -625,6 +683,7 @@ node_peephole :: proc(m: ^Module, n: ^Node) -> (out: ^Node) {
 				type = t.tuple[n.proj]
 			}
 		case .If: type = type_tuple_if
+		case .Region: type = type_ctrl
 		case .Constant: type = n.type
 		case .Add, .Sub, .Mul, .Div, .Bool_EQ, .Bool_LT, .Bool_LE:
 			i1 := node_edges_get(n.inputs, 1)
@@ -709,6 +768,14 @@ node_peephole :: proc(m: ^Module, n: ^Node) -> (out: ^Node) {
 						swap = false
 					} else if type_is_constant(hi.type) {
 						swap = true
+					} else if lo.kind == .Phi && node_all_inputs_constant(lo) {
+						swap = false
+					} else if hi.kind == .Phi && node_all_inputs_constant(hi) {
+						swap = true
+					} else if lo.kind == .Phi && hi.kind != .Phi {
+						swap = true
+					} else if hi.kind == .Phi && lo.kind != .Phi {
+						swap = false
 					} else {
 						swap = lo.id > hi.id
 					}
@@ -717,6 +784,30 @@ node_peephole :: proc(m: ^Module, n: ^Node) -> (out: ^Node) {
 
 				if type_is_constant_integer(t2) && t2.constant == 0 { // Add with 0
 					idealize_node = lhs
+				} else if phi := node_input(lhs, 2); // Holy moly, ((x + (phi cons)) + con), ((x + (phi cons)) + (phi cons)) -> x + (phi con0+con0 ...)
+				          phi.kind == .Phi &&
+	 	           node_all_inputs_constant(phi) &&
+														(type_is_constant(t2) ||
+															(rhs.kind == .Phi &&
+															 node_input(phi, 0) == node_input(rhs, 0) &&
+															 node_all_inputs_constant(rhs)))
+				{
+					runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+					nodes   := make([]^Node, node_len_inputs(phi), allocator = context.temp_allocator)
+					nodes[0] = node_input(phi, 0)
+
+					if type_is_constant(t2) {
+						for i in 1..<len(nodes) {
+						 nodes[i] = node_peephole(m, node_add(m, node_input(phi, i), rhs))
+						}
+					} else {
+						for i in 1..<len(nodes) {
+						 nodes[i] = node_peephole(m, node_add(m, node_input(phi, i), node_input(rhs, i)))
+						}
+					}
+
+					rhs_phi      := node_peephole(m, node_phi(m, nodes[0], ..nodes[1:]))
+					idealize_node = node_add(m, node_input(lhs, 1), rhs_phi)
 				} else if lhs == rhs { // Add by itself
 					idealize_node = node_mul(m, lhs, node_peephole(m, node_constant(m, m.start, 2)))
 				} else if lhs.kind != .Add && rhs.kind == .Add { // Move non-add to rhs
@@ -764,6 +855,54 @@ node_peephole :: proc(m: ^Module, n: ^Node) -> (out: ^Node) {
 					}
 					idealize_node = node_constant(m, m.start, int(result))
 				}
+			case .Phi:
+				same_op :: proc(node: ^Node) -> (same: bool) {
+					same = true
+					first_kind := node_input(node, 1).kind
+					for i in 2..<node_len_inputs(node) {
+						if first_kind != node_input(node, i).kind {
+							same = false
+							break
+						}
+					}
+					return
+				}
+
+				same_inputs :: proc(node: ^Node) -> (same: bool) {
+					same = true
+					first_node := node_input(node, 1)
+					for i in 2..<node_len_inputs(node) {
+						if first_node != node_input(node, i) {
+							same = false
+							break
+						}
+					}
+					return
+				}
+
+				if same_inputs(n) {
+					idealize_node = node_input(n, 1)
+				} else {
+					op := node_input(n, 1)
+					if node_len_inputs(n) == 3 &&
+					   node_input(n, 0) == nil &&
+								!node_is_cfg(op) &&
+								same_op(n)
+					{
+						runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+						lhss := make([]^Node, node_len_inputs(n), allocator = context.temp_allocator)
+						rhss := make([]^Node, node_len_inputs(n), allocator = context.temp_allocator)
+						lhss[0] = node_input(n, 0)
+						rhss[0] = node_input(n, 0)
+						for i in 1..<node_len_inputs(n) {
+							lhss[i] = node_input(node_input(n, i), 1)
+							rhss[i] = node_input(node_input(n, i), 2)
+						}
+						phi_lhs := node_phi(m, lhss[0], ..lhss[1:])
+						phi_rhs := node_phi(m, lhss[0], ..lhss[1:])
+						idealize_node = node_copy(m, op.kind, phi_lhs, phi_rhs)
+					}
+				}
 			}
 
 			if idealize_node != nil {
@@ -776,7 +915,7 @@ node_peephole :: proc(m: ^Module, n: ^Node) -> (out: ^Node) {
 
 node_is_cfg :: proc(node: ^Node) -> bool {
 	if node.kind == .Proj {
-		return node.proj == 0
+		return node.proj == 0 || node_input(node, 0).kind == .If
 	}
 	return .Cfg in node_metadata[node.kind].flags
 }
@@ -791,7 +930,10 @@ node_string :: proc(node: ^Node, allocator: mem.Allocator) -> string {
 	case .Proj:
 		strings.write_string(&b, "Proj ")
 		strings.write_int(&b, node.proj)
-	case .If: strings.write_string(&b, "If")
+	case .If:     strings.write_string(&b, "If")
+	case .Phi:    strings.write_string(&b, "Phi")
+	case .Region: strings.write_string(&b, "Region")
+	case .Stop:   strings.write_string(&b, "Stop")
 	case .Constant:
 		strings.write_string(&b, "Constant ")
 		strings.write_int(&b, node.type.constant)
