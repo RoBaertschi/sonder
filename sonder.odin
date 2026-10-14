@@ -33,6 +33,10 @@ Type_Kind :: enum {
 	Bottom,
 	Top,
 	Ctrl,
+	XCtrl, // ~Ctrl
+
+	Simple_End = XCtrl,
+
 	Integer_Constant,
 	Integer,          // constant == 0 = top, constant == 1 = bottom
 	Tuple,
@@ -51,10 +55,10 @@ type_bottom := Type { kind = .Bottom }
 type_top := Type { kind = .Top }
 
 @(rodata)
-type_ctrl := Type { kind = .Ctrl, constant = 0 }
+type_ctrl := Type { kind = .Ctrl }
 
 @(rodata)
-type_xctrl := Type { kind = .Ctrl, constant = 1 }
+type_xctrl := Type { kind = .XCtrl }
 
 @(rodata)
 type_integer_bottom := Type { kind = .Integer, constant = 1 }
@@ -63,7 +67,17 @@ type_integer_bottom := Type { kind = .Integer, constant = 1 }
 type_integer_top := Type { kind = .Integer, constant = 0 }
 
 @(rodata)
-type_tuple_if := Type { kind = .Tuple, tuple = { { kind = .Ctrl }, { kind = .Ctrl } } }
+type_tuple_if_both := Type { kind = .Tuple, tuple = { { kind = .Ctrl }, { kind = .Ctrl } } }
+
+@(rodata)
+type_tuple_if_neither := Type { kind = .Tuple, tuple = { { kind = .XCtrl }, { kind = .XCtrl } } }
+
+@(rodata)
+type_tuple_if_true := Type { kind = .Tuple, tuple = { { kind = .Ctrl }, { kind = .XCtrl } } }
+
+@(rodata)
+type_tuple_if_false := Type { kind = .Tuple, tuple = { { kind = .XCtrl }, { kind = .Ctrl } } }
+
 
 TYPE_INTEGERS :: bit_set[Type_Kind]{.Integer_Constant, .Integer}
 
@@ -84,9 +98,14 @@ type_tuple_from_module :: proc(m: ^Module, types: ..Type) -> (t: Type) {
 	return
 }
 
+type_is_simple :: proc(t: Type) -> (is_simple: bool) {
+	is_simple = t.kind <= .Simple_End
+	return
+}
+
 type_is_constant :: proc(t: Type) -> (is_constant: bool) {
 	switch t.kind {
-	case .Top, .Integer_Constant: is_constant = true
+	case .Top, .XCtrl, .Integer_Constant: is_constant = true
 
 	case .Integer, .Bottom,
 			   .Ctrl,    .Tuple:  is_constant = false
@@ -107,24 +126,89 @@ type_is_integer_top :: proc(t: Type) -> bool {
 }
 
 type_meet :: proc(lhs, rhs: Type) -> (result: Type) {
-	switch lhs.kind {
-	case .Tuple: unimplemented()
-	case .Integer, .Integer_Constant:
-		if type_is_integer(rhs) {
-			if type_is_integer_bottom(lhs) || type_is_integer_bottom(rhs) {
-				result = type_integer_bottom
-			} else if type_is_integer_top(lhs) {
-				result = rhs
-			} else if type_is_integer_top(rhs) {
+// 	Pattern_Result_Use :: enum {
+// 		A,
+// 		B,
+// 		Result,
+// 		Fail,
+// 	}
+//
+// 	Pattern_Operator :: enum {
+// 		And,
+// 		Or,
+// 	}
+//
+// 	Type_Kinds :: bit_set[Type_Kind]
+//
+// 	Pattern :: struct {
+// 		a:      bit_set[Type_Kind],
+// 		b:      bit_set[Type_Kind],
+// 		result: Type,
+// 		use:    Pattern_Result_Use,
+// 		swap:   bool,
+// 		op:     Pattern_Operator,
+// 	}
+//
+// 	int_like := Type_Kinds{.Integer_Constant, .Integer}
+// 	bot := Type_Kinds { .Bottom }
+// 	top := Type_Kinds { .Top }
+// 	ctrl := Type_Kinds { .Ctrl }
+// 	xctrl := Type_Kinds { .XCtrl }
+//
+// 	patterns := []Pattern{
+// 		// Tuple
+// 		{ a = { .Tuple }, b = { .Tuple }, use = .Fail, op = .Or },
+//
+// 		// Integer
+// 		{ a = int_like }
+//
+// 		// General
+// 		{ a = bot, b = top, use = .A, swap = true },
+// 		{ a = ctrl, b = ctrl, result = type_ctrl, use = .Result, op = .Or },
+// 		{ a = xctrl, b = xctrl, result = type_xctrl, use = .Result, op = .Or },
+// 	}
+
+	lhs := lhs
+	rhs := rhs
+
+	match_or :: proc(lhs, rhs: Type, lhs_kind, rhs_kind: Type_Kind) -> (matched: bool) {
+		matched = lhs.kind == lhs_kind || rhs.kind == rhs_kind
+		return
+	}
+
+	if !type_is_simple(rhs) && type_is_simple(lhs) {
+		// Swap the simple side to the right side
+		lhs, rhs = rhs, lhs
+	}
+
+	if type_is_simple(lhs) {
+		if match_or(lhs, rhs, .Top, .Bottom) {
 				result = lhs
-			} else {
-				assert(lhs.kind == .Integer_Constant && rhs.kind == .Integer_Constant)
-				result = lhs if lhs.constant == rhs.constant else type_bottom
+			} else if match_or(lhs, rhs, .Bottom, .Top) {
+				result = rhs
+			} else if type_is_simple(rhs) {
+				result = match_or(lhs, rhs, .Ctrl, .Ctrl) ? type_ctrl : type_xctrl
 			}
-			break
+	} else {
+		switch lhs.kind {
+		case .Tuple: unimplemented()
+		case .Integer, .Integer_Constant:
+			if type_is_integer(rhs) {
+				if type_is_integer_bottom(lhs) || type_is_integer_bottom(rhs) {
+					result = type_integer_bottom
+				} else if type_is_integer_top(lhs) {
+					result = rhs
+				} else if type_is_integer_top(rhs) {
+					result = lhs
+				} else {
+					assert(lhs.kind == .Integer_Constant && rhs.kind == .Integer_Constant)
+					result = lhs if lhs.constant == rhs.constant else type_bottom
+				}
+				break
+			}
+			fallthrough
+		case .XCtrl, .Ctrl, .Bottom, .Top: result = type_bottom
 		}
-		fallthrough
-	case .Bottom, .Top, .Ctrl: result = type_bottom
 	}
 
 	return
@@ -507,7 +591,7 @@ node_scope_dup :: proc(m: ^Module, scope: ^Node) -> (dup_scope: ^Node) {
 node_scope_merge :: proc(m: ^Module, into, from: ^Node) -> (r: ^Node) {
 	assert(node_len_inputs(into) == node_len_inputs(from))
 	assert(into.scope == from.scope)
-	r = node_peephole(m, node_region(m, nil, node_input(into, 0), node_input(from, 0)))
+	r = node_keep(node_region(m, nil, node_input(into, 0), node_input(from, 0)))
 	defer node_kill(m, from) // dies
 
 	// Skip the ctrl node
@@ -517,6 +601,9 @@ node_scope_merge :: proc(m: ^Module, into, from: ^Node) -> (r: ^Node) {
 			node_set_def(m, into, i, node_peephole(m, node_phi(m, r, a_node, b_node)))
 		}
 	}
+
+	node_unkeep(r)
+	r = node_peephole(m, r)
 	return
 }
 
@@ -569,6 +656,17 @@ node_len_outputs :: proc(node: ^Node) -> (len: int) {
 
 node_remove_use :: proc(node: ^Node, use: ^Node) {
 	node_edges_unordered_remove(&node.outputs, node_edges_find(node.outputs, use))
+}
+
+node_remove_def :: proc(m: ^Module, node: ^Node, index: int) {
+	old_def := node_input(node, index)
+	if old_def != nil {
+		node_remove_use(old_def, node)
+		if node_len_outputs(old_def) == 0 {
+			node_kill(m, old_def)
+		}
+	}
+	node_edges_unordered_remove(&node.inputs, index)
 }
 
 node_add_def :: proc(m: ^Module, n: ^Node, new_def: ^Node) -> (n_index: int) {
@@ -906,6 +1004,21 @@ node_peephole :: proc(m: ^Module, n: ^Node) -> (out: ^Node) {
 						phi_rhs := node_phi(m, lhss[0], ..lhss[1:])
 						idealize_node = node_copy(m, op.kind, phi_lhs, phi_rhs)
 					}
+				}
+			case .Return:
+				if node_input(n, 0).type.kind == .XCtrl {
+					idealize_node = node_input(n, 0)
+				}
+			case .Stop:
+				current_len := node_len_inputs(n)
+				for i := 0; i < node_len_inputs(n); i += 1 {
+					if node_input(n, i).type.kind == .XCtrl {
+						node_remove_def(n, i)
+						i -= 1
+					}
+				}
+				if node_len_inputs(n) != current_len {
+					idealize_node = n
 				}
 			}
 
